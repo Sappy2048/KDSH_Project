@@ -1,134 +1,232 @@
-#This program simply fetches the important nodal entities and relations using an llm query and pushes them into the driver instance
-#for more information on neo4J visit https://neo4j.com/docs/python-manual/current/
-import os
-import json
-from google import genai
-from google.genai import types
-from neo4j import GraphDatabase
+import pathway as pw
+import  warnings
+import csv
 from dotenv import load_dotenv
-import networkx as nx #remove in final draft
-import matplotlib.pyplot as plt #remove in final draft
+from pathway.xpacks.llm.splitters import RecursiveSplitter
+from pathway.stdlib.ml.index import KNNIndex
 
+# Import our custom connector
+from graph_connector import GraphIngestor
+from embedder import get_embedding
+from decomposer import get_claims
+from final_reasoner import generate_verdict
+
+# Load environment variables
 load_dotenv()
 
-class GraphIngestor():
-    def __init__(self):
-        uri = "neo4j://127.0.0.1:7687"
-        user = "neo4j"
-        password = "kdsh@123"
-        try:
-            self.driver = GraphDatabase.driver( #launches a driver instance, relying on local now switch to docker
-                uri,
-                auth=(user,password)
-            )
-            self.driver.verify_connectivity() #throw an error is unsuccessful
-        except Exception as e:
-            print(f"Neo4j connection failed: {e}")
-            self.driver = None
-        self.client=genai.Client(api_key=os.getenv('GEMINI_API_KEY')) #Setup the llm to generate nodes, in this case gemini
-        self.system_instruction = self._load_prompt() #load the llm prompt into this var
+# Suppress the harmless "pkg_resources" warning
+warnings.filterwarnings("ignore", category=UserWarning)
 
-    def _load_prompt(self): #Reads the prompt from config/schema_prompt
-        try:
-            prompt_path = os.path.join(os.path.dirname(__file__), "../config/schema_prompt.txt")
-            with open(prompt_path, "r") as f:
-                return f.read()
-        except:
-            print("Prompt file not found. Using default prompt") #if the prompt file is not found, use the default prompt
-            return "Extract the entities and relations in this text in JSON format"
-        
+splitter = RecursiveSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ".", "!", "?", " ", ""]
+)
 
-    def _push_to_db(self,json_data):
-        """This method runs the cypher query using the json data. """
-        if not  self.driver or not json_data:
-            return "(no driver or empty data)"
-        query = """
-        UNWIND $nodes AS n
-        MERGE (e:Entity {id: n.id})
-        SET e.label = n.type
-        
-        WITH e
-        UNWIND $edges AS r
-        MATCH (source:Entity {id: r.source})
-        MATCH (target:Entity {id: r.target})
-        MERGE (source)-[rel:RELATIONSHIP {type: r.relation}]->(target)
-        """
-        
-        try:
-            with self.driver.session() as session:
-                session.run(query, 
-                            nodes=json_data.get('nodes', []), 
-                            edges=json_data.get('edges', []))
-            return "Success"
-        except Exception as e:
-            return f"Neo4j Error: {str(e)}"
-        
-    def process(self,text_chunk):
-        try:
-            response = self.client.models.generate_content(
-                    model="gemini-2.5-flash-lite",
-                    contents=text_chunk,
-                    config=types.GenerateContentConfig(
-                        system_instruction=self.system_instruction,
-                        response_mime_type="application/json"
-                    )
-                )
-            graph_data = json.loads(response.text)
-            status = self._push_to_db(graph_data)
-            return status
-        except Exception as e:
-            return f"Pipeline Error: {e}"
-        
-    def close(self):
-        if self.driver:
-            self.driver.close()
+def prepare_clean_csv(input_file, output_file):
+    """
+    Reads the original CSV, renames the 'id' header to 'query_number',
+    and saves it to a temporary file for Pathway to read safely.
+    """
+    try:
+        with open(input_file, 'r', encoding='utf-8-sig') as f_in: # utf-8-sig handles BOM (\ufeff)
+            reader = csv.reader(f_in)
+            headers = next(reader) # Read the first row (headers)
             
-    def visualize_graph(self): #remove in final draft
-        # 2. Fetch Data (Limit to 50 edges so the plot isn't a mess)
-        query = """
-        MATCH (s)-[r]->(t)
-        RETURN s.id AS source, type(r) AS edge, t.id AS target
-        LIMIT 50
-        """
-        
-        results = []
-        with self.driver.session() as session:
-            results = session.run(query).data()
-    
-        if not results:
-            print("Graph is empty! Run the ingestion first.")
-            return
-    
-        # 3. Build NetworkX Graph
-        G = nx.DiGraph() # Directed Graph
-        
-        for row in results:
-            G.add_edge(row['source'], row['target'], label=row['edge'])
-    
-        # 4. Draw it
-        plt.figure(figsize=(10, 8))
-        pos = nx.spring_layout(G, k=0.5) # k controls the distance between nodes
-        
-        # Draw nodes and edges
-        nx.draw(G, pos, 
-                with_labels=True, 
-                node_size=2000, 
-                node_color="lightblue", 
-                font_size=10, 
-                font_weight="bold", 
-                arrows=True)
-        
-        # Draw edge labels (relationships)
-        edge_labels = nx.get_edge_attributes(G, 'label')
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='red')
-        
-        plt.title("Knowledge Graph Preview (First 50 Relations)")
-        plt.show()
-        
-graph_ingestor=GraphIngestor()
-graph_ingestor._load_prompt()
-text_chunk="Before the law sits a gatekeeper. To this gatekeeper comes a man from the country who asks to gain entry into the law. But the gatekeeper says that he cannot grant him entry at the moment. The man thinks about it and then asks if he will be allowed to come in later on. “It is possible,” says the gatekeeper, “but not now.” At the moment the gate to the law stands open, as always, and the gatekeeper walks to the side, so the man bends over in order to see through the gate into the inside. When the gatekeeper notices that, he laughs and says: “If it tempts you so much, try it in spite of my prohibition. But take note: I am powerful. And I am only the most lowly gatekeeper. But from room to room stand gatekeepers, each more powerful than the other. I can’t endure even one glimpse of the third.” The man from the country has not expected such difficulties: the law should always be accessible for everyone, he thinks, but as he now looks more closely at the gatekeeper in his fur coat, at his large pointed nose and his long, thin, black Tartar’s beard, he decides that it would be better to wait until he gets permission to go inside. The gatekeeper gives him a stool and allows him to sit down at the side in front of the gate. There he sits for days and years. He makes many attempts to be let in, and he wears the gatekeeper out with his requests. The gatekeeper often interrogates him briefly, questioning him about his homeland and many other things, but they are indifferent questions, the kind great men put, and at the end he always tells him once more that he cannot let him inside yet. The man, who has equipped himself with many things for his journey, spends everything, no matter how valuable, to win over the gatekeeper. The latter takes it all but, as he does so, says, “I am taking this only so that you do not think you have failed to do anything.” During the many years the man observes the gatekeeper almost continuously. He forgets the other gatekeepers, and this one seems to him the only obstacle for entry into the law. He curses the unlucky circumstance, in the first years thoughtlessly and out loud, later, as he grows old, he still mumbles to himself. He becomes childish and, since in the long years studying the gatekeeper he has come to know the fleas in his fur collar, he even asks the fleas to help him persuade the gatekeeper. Finally his eyesight grows weak, and he does not know whether things are really darker around him or whether his eyes are merely deceiving him. But he recognizes now in the darkness an illumination which breaks inextinguishably out of the gateway to the law. Now he no longer has much time to live. Before his death he gathers in his head all his experiences of the entire time up into one question which he has not yet put to the gatekeeper. He waves to him, since he can no longer lift up his stiffening body."
-print(graph_ingestor.process(text_chunk))
-graph_ingestor.visualize_graph()
-graph_ingestor.close()
+            # Find the problematic "id" column (handling potential whitespace/BOM)
+            # We look for any header that *looks* like "id"
+            id_index = -1
+            for i, h in enumerate(headers):
+                if h.strip().lower() == "id":
+                    headers[i] = "query_number" # RENAME IT!
+                    id_index = i
+                    break
+            
+            # If we couldn't find "id", just assume the first col is the ID
+            if id_index == -1:
+                headers[0] = "query_number"
 
+            # Write the clean file
+            with open(output_file, 'w', newline='', encoding='utf-8') as f_out:
+                writer = csv.writer(f_out)
+                writer.writerow(headers) # Write clean headers
+                writer.writerows(reader) # Write the rest of the data
+                
+        print(f"✅ Created clean shadow file: {output_file}")
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Could not process CSV: {e}")
+
+# Run the prep immediately
+prepare_clean_csv("./queries.csv", "./queries_temp.csv")
+# Schema for the Knowledge Base (The files you are searching AGAINST)
+# We assume these are still plain text files in the ./data folder
+class DocumentSchema(pw.Schema):
+    path: str
+    data: str
+
+# Schema for the Query CSV (The file provided in your screenshot)
+class BackstoryQuerySchema(pw.Schema):
+    query_number: str 
+    book_name: str
+    char: str
+    caption: str
+    content: str  # <--- This is what we will embed and search for
+    
+#splits text into chunks for embedding
+@pw.udf
+def split_text(text: str, chunk_size: int) -> list[str]:
+    if not text:
+        return []
+    # Simple character-based splitting
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+#responsible for breaking the text chunk into separate claims
+@pw.udf     
+def decompose_udf(text: str) -> list[str]:
+    return get_claims(text)
+
+@pw.udf
+def reasoner_udf(claim: str, text: str, graph: str) -> tuple[str, str]:
+    return generate_verdict(claim, text, graph)
+
+def run_pipeline():
+    # 1. Define Input Source (Watched Folder)
+    # mode="streaming" ensures it reacts to new files instantly
+    documents=pw.io.fs.read(
+        "./data",
+        format="plaintext",  # <--- CHANGED FROM 'binary'
+        mode="streaming",
+        with_metadata=True
+    )
+
+    # 3. Initialize the Graph Ingestor
+    # We initialize it once (logic inside handles connection pooling)
+    ingestor = GraphIngestor()
+
+    # 4. Apply the UDF (User Defined Function)
+    # We wrap the ingestor.process method as a Pathway UDF
+    @pw.udf
+    def extract_and_load(text: str) -> str:
+        return ingestor.process(text)
+    
+    # UDF for Retrieval (Searching the Graph) -- NEW
+    @pw.udf
+    def search_graph_udf(query: str) -> str:
+        return ingestor.search(query)
+    
+    # --- TRACK A: VECTOR INDEX (New) ---
+    
+    # A.1 Chunking
+    # We split the long novel into smaller chunks for vector search.
+    # We include 'path' so we know which book the chunk came from.
+    chunks = documents.select(
+        path=pw.this._metadata["path"],
+        chunk=splitter(pw.this.data) # Simple 500-char splitter
+    ).flatten(pw.this.chunk) # Flattens the list of chunks into individual rows
+
+    graph_results = documents.select(
+        path=pw.this._metadata["path"],
+        ingestion_status=extract_and_load(pw.this.chunk)
+    )
+    # A.2 Embedding
+    # Apply our Gemini Embedder UDF to each chunk
+    knowledge_vectors = chunks.select(
+        path=pw.this.path,
+        chunk_text=pw.this.chunk,
+        vector=get_embedding(pw.this.chunk)
+    )
+
+    # A.3 Indexing (KNN)
+    # This creates a searchable index in memory. 
+    # 1. Read the CSV file containing the backstories/queries
+    # mode="static" reads it once. mode="streaming" watches for new lines.
+    queries = pw.io.csv.read(
+        "./queries_temp.csv",  # Ensure this matches your actual filename
+        schema=BackstoryQuerySchema,
+        mode="static",
+    )
+    # NEW: Decompose Backstories into Atomic Claims
+    # This turns 1 row (Backstory) -> Many rows (Claims)
+    claims = queries.select(
+        original_query_id=pw.this.query_number,
+        character=pw.this.char,
+        # We keep the original text for reference
+        original_backstory=pw.this.content, 
+        # The UDF returns a list ['Claim 1', 'Claim 2']
+        claim_list=decompose_udf(pw.this.content) 
+    ).flatten(pw.this.claim_list) # Flatten creates a new row for every item in the list
+    
+    query_vectors = claims.select(
+        query_id=pw.this.original_query_id,
+        character=pw.this.character,
+        query_content=pw.this.claim_list,
+        vector=get_embedding(pw.this.claim_list),
+        graph_evidence=search_graph_udf(pw.this.claim_list)
+    )
+
+    # 3. Perform the Search (KNN Join)
+    # This finds the 3 chunks in your Knowledge Base most similar to each backstory
+   # A. Create the Indexer
+    # We tell it: "Here are the vectors (knowledge_vectors.vector) 
+    # and here is the data associated with them (knowledge_vectors)"
+    indexer = KNNIndex(
+        data=knowledge_vectors,
+        n_dimensions=768,
+        data_embedding=knowledge_vectors.vector
+    )
+    
+    # 2. Query the Index
+    # Use 'get_nearest_items' instead of 'query' or '_query'
+    matches = indexer.get_nearest_items(
+        query_vectors.vector,      # The table of queries
+        k=3,                # Top 3 results
+    )
+    
+    # 3. The "Link Back" Logic
+    # We create a final table by combining the Match data with the Query data
+    results = matches.join(
+        query_vectors,
+        matches.id == query_vectors.id  # Match the Result ID to the Query ID
+    ).select(
+        # Columns from the Original Query (Right side of join)
+        query_vectors.query_id,
+        query_vectors.character,
+        claim=query_vectors.query_content,
+        
+        analysis=reasoner_udf(
+            query_vectors.query_content, 
+            matches.chunk_text, 
+            query_vectors.graph_evidence
+        ),
+        # Columns from the Search Result (Left side of join)
+        found_text=matches.chunk_text,
+        found_graph_facts=query_vectors.graph_evidence,
+        found_path=matches.path
+    ).select(
+        # Now we unpack that analysis into the final columns
+        pw.this.query_id,
+        pw.this.character,
+        pw.this.claim,
+        verdict=pw.this.analysis[0],   # Index 0 is the Verdict
+        rationale=pw.this.analysis[1], # Index 1 is the Rationale
+        evidence_text=pw.this.found_text,
+        evidence_graph=pw.this.found_graph_facts
+    )
+    
+    # 6. Output/Debug
+    # For now, we print the status to the console so you can see it working.
+    # In production, you might write this log to a file or another DB.
+    pw.io.csv.write(graph_results, "ingestion_logs.csv")
+    
+    # Log Vector Data (Track A) - Just to verify we are getting numbers!
+    #pw.io.jsonlines.write(knowledge_vectors, "logs_vector_debug.jsonl")
+    
+    # Write the results to a new CSV file
+    pw.io.csv.write(results, "search_results_output.csv")
+    
+    # Run the pipeline
+    pw.run()
+
+if __name__ == "__main__":
+    run_pipeline()
