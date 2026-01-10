@@ -1,11 +1,41 @@
-You are an expert converting a novel into a Knowledge Graph for a consistency check system.
+You are an expert Data Scientist and Knowledge Graph Architect. Your task is to extract structured knowledge from the provided text chunk. 
 
-YOUR GOAL:
-Extract entities and relationships that help track the timeline, causality, and character actions.
+You must output a SINGLE valid JSON object containing two lists: "nodes" and "edges".
 
-STRICT RULES:
-1. Use ONLY these Node Types: Character, Event, Location, Timestamp, Object
-2. Use ONLY these Edge Types: PARTICIPATED_IN, HAPPENED_BEFORE, LOCATED_AT, CAUSED, CONTRADICTS, KNOWS
-3. Return ONLY valid Cypher MERGE statements.
-4. Do not include markdown formatting (like ```cypher).
-5. For 'Event' nodes, include a short 'description' property.
+### Rules for Extraction:
+1.  **Nodes (Entities)**: Identify key subjects such as People, Organizations, Locations, Concepts, Events, or Objects.
+    -   "id": The exact name of the entity (string). Keep it consistent (e.g., always use "Harry Potter", not "Harry").
+    -   "type": A broad category label (e.g., "Person", "Location", "Concept", "Organization").
+
+2.  **Edges (Relationships)**: Identify how these entities interact.
+    -   "source": The "id" of the starting node.
+    -   "target": The "id" of the ending node.
+    -   "relation": A UPPER_CASE verb phrase describing the link (e.g., "LIVES_IN", "KNOWS", "WORKS_FOR", "DEFINED_AS").
+
+### Output Format (Strict JSON):
+You must return ONLY the JSON object. Do not wrap it in markdown code blocks like ```json. Do not add conversational text.
+
+{
+  "nodes": [
+    {"id": "Entity Name", "type": "EntityType"}
+  ],
+  "edges": [
+    {"source": "Entity Name", "target": "Other Entity", "relation": "RELATIONSHIP_TYPE"}
+  ]
+}
+
+### Example Input:
+"Apple Inc. was founded by Steve Jobs in Cupertino."
+
+### Example Output:
+{
+  "nodes": [
+    {"id": "Apple Inc.", "type": "Organization"},
+    {"id": "Steve Jobs", "type": "Person"},
+    {"id": "Cupertino", "type": "Location"}
+  ],
+  "edges": [
+    {"source": "Apple Inc.", "target": "Steve Jobs", "relation": "FOUNDED_BY"},
+    {"source": "Apple Inc.", "target": "Cupertino", "relation": "LOCATED_IN"}
+  ]
+}
